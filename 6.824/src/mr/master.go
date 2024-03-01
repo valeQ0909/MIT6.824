@@ -8,17 +8,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"net"
+	"os"
+	"net/rpc"
+	"net/http"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
 
 var mu sync.Mutex
 
 type Master struct {
 	// Your definitions here.
-	TaskId            int           //自增的id,每一个任务都是通过Master初始化的,这个属性主要是为了给Task分配唯一id
+	TaskId            int           // 自增的id,每一个任务都是通过Master初始化的,这个属性主要是为了给Task分配唯一id
 	ReducerNum        int           // reducer 数量
 	files             []string      // 传入的文件数组
 	TaskChannelReduce chan *Task    // Reduce 任务
@@ -27,9 +27,33 @@ type Master struct {
 	Phase             Phase         // 程序所处阶段(map/reduce/done)
 }
 
+// MakeMaster
+// create a Master.
+// main/mrmaster.go calls this function.
+// nReduce is the number of reduce tasks to use.
+func MakeMaster(files []string, nReduce int) *Master {
+	m := Master{
+		files:             files,
+		ReducerNum:        nReduce,
+		TaskChannelMap:    make(chan *Task, len(files)),
+		TaskChannelReduce: make(chan *Task, nReduce),
+		TaskMap:           make(map[int]*Task, len(files)+nReduce),
+		Phase:             MapPhase,
+	}
+
+	// Your code here.
+	m.makeMapTasks(files)  //发布mapreduce中的map任务，等待worker来取
+	m.server()
+
+	go m.CrashDetector()
+
+	return &m
+}
+
+
 // Your code here -- RPC handlers for the worker to call.
 
-// PollTask rpc调用，轮询任务
+// PollTask rpc调用，worker轮询任务
 func (m *Master) PollTask(args *TaskArgs, reply *Task) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -38,16 +62,14 @@ func (m *Master) PollTask(args *TaskArgs, reply *Task) error {
 	// 处于 map 阶段
 	case MapPhase:
 		{
-			if len(m.TaskChannelMap) > 0 {
+			if len(m.TaskChannelMap) > 0 { // 如果当前有map任务，发一个任务给这个worker
 				*reply = *<-m.TaskChannelMap
-				if !m.judgeState(reply.TaskId) {
-					// task 不处于 Waiting 状态
+				if !m.judgeState(reply.TaskId) { // task 不处于 Waiting 状态
 					fmt.Printf("Map-taskid[ %d ] is running\n", reply.TaskId)
 				}
-			} else {
-				// TaskChannelMap 中没有空闲的 map 节点可以使用了
+			} else { // master中没有mapreduce中的map任务了
 				reply.TaskType = WaittingTask
-				if m.checkTaskDone() {
+				if m.checkTaskDone() { //当master检测到所有map任务都完成后，系统进入reduce阶段
 					m.toNextPhase()
 				}
 				return nil
@@ -61,9 +83,9 @@ func (m *Master) PollTask(args *TaskArgs, reply *Task) error {
 				if !m.judgeState(reply.TaskId) {
 					fmt.Println("Reduce-task is running", reply)
 				}
-			} else {
-				reply.TaskType = WaittingTask // 如果reduce任务被分发完了但是又没完成，此时就将任务设为Waitting
-				if m.checkTaskDone() {
+			} else { // master中没有reduce任务了
+				reply.TaskType = WaittingTask 
+				if m.checkTaskDone() { //当master检测到所有reduce任务都完成后，系统进入AllDown阶段
 					m.toNextPhase()
 				}
 				return nil
@@ -108,40 +130,19 @@ func (m *Master) server() {
 // Done
 // main/mrmaster.go calls Done() periodically to find out
 // if the entire job has finished.
-// 定期调用Done()来查找整个job是否已经完成
+// main/mrmaster.go 周期性调用Done()来查找整个job是否已经完成
 func (m *Master) Done() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	if m.Phase == AllDone {
-		fmt.Println("[INFO] All tasks are finished,the coordinator will be exit.")
+		fmt.Println("[INFO] All tasks are finished,the master will be exit.")
 		return true
 	} else {
 		return false
 	}
 }
 
-// MakeMaster
-// create a Master.
-// main/mrmaster.go calls this function.
-// nReduce is the number of reduce tasks to use.
-func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{
-		files:             files,
-		ReducerNum:        nReduce,
-		TaskChannelMap:    make(chan *Task, len(files)),
-		TaskChannelReduce: make(chan *Task, nReduce),
-		TaskMap:           make(map[int]*Task, len(files)+nReduce),
-		Phase:             MapPhase,
-	}
-
-	// Your code here.
-	m.makeMapTasks(files)
-	m.server()
-	go m.CrashDetector()
-	return &m
-}
-
-// makeMapTasks 对map任务进行处理,初始化map任务
+// makeMapTasks 初始化map任务
 func (m *Master) makeMapTasks(files []string) {
 	for _, v := range files {
 		// 生成唯一 id
@@ -151,15 +152,16 @@ func (m *Master) makeMapTasks(files []string) {
 			TaskId:     id,
 			ReducerNum: m.ReducerNum,
 			Files:      []string{v},
-			State:      Waiting,
+			State:      Waiting,  // 等待被worker执行
 		}
-		m.TaskMap[id] = &task
+		m.TaskMap[id] = &task //向TaskMap中分配任务
 		m.TaskChannelMap <- &task
 	}
 }
 
 // 对reduce任务进行处理,初始化reduce任务
 func (m *Master) makeReduceTasks() {
+	// 生成m.ReducerNum个reduce任务
 	for i := 0; i < m.ReducerNum; i++ {
 		id := m.generateTaskId()
 		task := Task{
@@ -177,13 +179,13 @@ func (m *Master) makeReduceTasks() {
 // 通过结构体的TaskId自增来获取唯一的任务id
 func (m *Master) generateTaskId() int {
 	res := m.TaskId
-	m.TaskId++
+	m.TaskId ++
 	return res
 }
 
 // 判断给定任务是否在工作，并修正其目前任务信息状态
 func (m *Master) judgeState(taskId int) bool {
-	task, ok := m.TaskMap[taskId]
+	task, ok := m.TaskMap[taskId]   // 如果键不存在，ok的值为false
 	if !ok || task.State != Waiting {
 		return false
 	}
@@ -215,8 +217,9 @@ func (m *Master) checkTaskDone() bool {
 			}
 		}
 	}
-	// map阶段的全部完成,reduce阶段的全部都还没开始
+	
 	if (mapDoneNum > 0 && mapUnDoneNum == 0) && (reduceDoneNum == 0 && reduceUnDoneNum == 0) {
+		// map阶段的全部完成,reduce阶段的全部都还没开始
 		return true
 	} else if reduceDoneNum > 0 && reduceUnDoneNum == 0 {
 		// reduce阶段的全部完成
@@ -227,12 +230,11 @@ func (m *Master) checkTaskDone() bool {
 
 // 切换到下一阶段
 func (m *Master) toNextPhase() {
-	// 当前在 map 阶段 map -> reduce
-	if m.Phase == MapPhase {
+	if m.Phase == MapPhase { // 当前在 map 阶段 map -> reduce
+		// 初始化reduce任务
 		m.makeReduceTasks()
 		m.Phase = ReducePhase
-		// 当前在 reduce 阶段 reduce -> AllDone
-	} else if m.Phase == ReducePhase {
+	} else if m.Phase == ReducePhase { // 当前在 reduce 阶段 reduce -> AllDone
 		m.Phase = AllDone
 	}
 }
@@ -269,17 +271,20 @@ func selectReduceName(reduceNum int) []string {
 	var s []string
 	// 获取当前工作目录
 	path, _ := os.Getwd()
+	//fmt.Println("当前工作目录： ", path)
 	// 获取当前工作目录下的所有文件
 	files, _ := ioutil.ReadDir(path)
-	for _, fi := range files {
+	for _, file := range files {
 		// 以 "mr-tmp" 开头并且以 reduceNum 结尾
-		if strings.HasPrefix(fi.Name(), "mr-tmp") && strings.HasSuffix(fi.Name(), strconv.Itoa(reduceNum)) {
-			s = append(s, fi.Name())
+		if strings.HasPrefix(file.Name(), "mr-tmp") && strings.HasSuffix(file.Name(), strconv.Itoa(reduceNum)) {
+			//fmt.Println("filename： ", file.Name())
+			s = append(s, file.Name())
 		}
 	}
 	return s
 }
 
+// 健壮性检测函数
 func (m *Master) CrashDetector() {
 	for {
 		// 每次执行任务会先休眠 2s

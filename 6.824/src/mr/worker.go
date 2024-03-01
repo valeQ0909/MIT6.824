@@ -38,17 +38,18 @@ func ihash(key string) int {
 }
 
 // Worker main/mrworker.go calls this function.
+// 由mian/mrworker.go调用执行
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	flag := true
 	for flag {
 		// send an RPC to the coordinator asking for a task
-		task := getTask()
+		task := getTask()  //向master轮询任务
 		switch task.TaskType {
 		case MapTask:
 			{
-				DoMapTask(mapf, &task)
+				DoMapTask(mapf, &task) //调用系统提供的mapf函数来对任务执行mapreduce的map任务
 				callDone(&task)
 			}
 		case ReduceTask:
@@ -77,7 +78,7 @@ func getTask() Task {
 	reqArgs := TaskArgs{}
 	task := Task{}
 
-	ok := call("master.PollTask", &reqArgs, &task)
+	ok := call("Master.PollTask", &reqArgs, &task)
 	if !ok {
 		fmt.Println("worker getTask call failed")
 	}
@@ -89,7 +90,8 @@ func getTask() Task {
 //  map节点再把这些缓存数据分成R块（对应 R 个 reduce 节点），并写入本地磁盘中。
 func DoMapTask(mapf func(string, string) []KeyValue, task *Task) {
 	var kvs []KeyValue
-	filepath := task.Files[0]
+	filepath := task.Files[0]   // map任务一个task只分配了一个file
+	fmt.Println("MapTask filepath： ", filepath)
 	file, err := os.Open(filepath) // Open返回的是*File类型
 	if err != nil {
 		fmt.Println("DoMapTask cannot open ", filepath)
@@ -103,15 +105,19 @@ func DoMapTask(mapf func(string, string) []KeyValue, task *Task) {
 
 	// map返回一组KV结构体数组
 	kvs = mapf(filepath, string(content))
-	//初始化并循环遍历 []KeyValue
-	rn := task.ReducerNum
-	// 创建一个长度为nReduce的二维切片
-	HashedKV := make([][]KeyValue, rn)
+	// 将mapf输出的kv键值对存储到二维切片HashedKV中，即,将这些kv交付给对应的reducer
+	reducerNum := task.ReducerNum
+	HashedKV := make([][]KeyValue, reducerNum) //用来存储对应reducer所需要处理的具体kv
 	for _, kv := range kvs {
-		HashedKV[ihash(kv.Key)%rn] = append(HashedKV[ihash(kv.Key)%rn], kv)
+		HashedKV[ihash(kv.Key)%reducerNum] = append(HashedKV[ihash(kv.Key)%reducerNum], kv)
 	}
+	
+	// 将map阶段生成的kvs存储至mr-tmp-*这些文件中
+	for i := 0; i < reducerNum; i++ {
+		// 将map阶段生成的kv键值对暂时存放在mr-tmp-*这些文件中。   
+		// 这里的i就是具体的reducer的编号了
 
-	for i := 0; i < rn; i++ {
+		// 这里这样命名是为了方便后面使用 strings.HasPrefix()和strings.HasSuffix()这两个判断前后缀的函数
 		outputFileName := "mr-tmp-" + strconv.Itoa(task.TaskId) + "-" + strconv.Itoa(i)
 		outputFile, _ := os.Create(outputFileName)
 		encodeFile := json.NewEncoder(outputFile)
@@ -144,12 +150,13 @@ func shuffle(files []string) []KeyValue {
 		file.Close()
 	}
 	sort.Sort(SortedKey(kvs))
+
 	return kvs
 }
 
-// DoReduceTask 将shuffle排好的键值对最后进行记数操作
-// shuffle后传出 <hello [1,1]> <MapReduce ,[1]> <world,[1]>
-// <hello ,2> <MapReduce ,1> <world,1>
+// DoReduceTask 将shuffle排好的键值对，最后进行记数操作
+// shuffle后传出 <hello, [1,1]> <MapReduce, [1]> <world,[1]>
+// reduce后为 <hello ,2> <MapReduce ,1> <world,1>
 func DoReduceTask(reducef func(string, []string) string, task *Task) {
 	reduceFileNum := task.TaskId
 	kvs := shuffle(task.Files)
@@ -158,17 +165,24 @@ func DoReduceTask(reducef func(string, []string) string, task *Task) {
 	if err != nil {
 		log.Fatal("[ERROR] Failed to create temp file", err)
 	}
+
+	// <hello, [1,1]> <MapReduce, [1]> <world,[1]>
+	// <hello ,2> <MapReduce ,1> <world,1>
 	i := 0
 	for i < len(kvs) {
-		j := i + 1
-		for j < len(kvs) && kvs[j].Key == kvs[i].Key {
-			j++
-		}
+		// <hello,1> <hello ,1> <MapReduce ,1> <world,1>
+		// <hello, [1,1]> <MapReduce, [1]> <world,[1]>	
+		// 本来应该交给shuffle做的，但是这样结构体的定义就冗余了，不如放在这里
 		var values []string
-		for k := i; k < j; k++ {
-			values = append(values, kvs[k].Value)
+		var j int
+		values = append(values, kvs[i].Value)
+		for j = i +1; j < len(kvs) && kvs[j].Key == kvs[i].Key; j++{
+			values = append(values, kvs[j].Value)
 		}
+		
+		// var reducef func(string, []string) string;
 		output := reducef(kvs[i].Key, values)
+		fmt.Println(kvs[i].Key, " ", output)
 		fmt.Fprintf(tempFile, "%v %v\n", kvs[i].Key, output)
 		i = j
 	}
@@ -202,16 +216,14 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 }
 
 // callDone Call RPC to mark the task as completed
-func callDone(finishedTask *Task) Task {
-
+// 告知master任务已经完成
+func callDone(task *Task) Task {
 	reply := Task{}
-	ok := call("Coordinator.SetTaskDone", finishedTask, &reply)
-
+	ok := call("Master.SetTaskDone", task, &reply)
 	if ok {
-		fmt.Println("[INFO] close task: ", finishedTask)
+		fmt.Println("worker close task: ", task)
 	} else {
 		fmt.Printf("call failed!\n")
 	}
 	return reply
-
 }

@@ -39,11 +39,11 @@ type Task struct {
 	StartTime  time.Time // 任务开始时间
 }
 
-// TaskType 枚举
-type TaskType int
+// TaskType 枚举  
+type TaskType int  // 将TaskType定义为int类型
 
-const (
-	MapTask      TaskType = iota // Map
+const (	//枚举
+	MapTask      TaskType = iota // Map    itoa是常量计数器
 	ReduceTask                   // Reduce
 	WaittingTask                 // 任务全部被分发完了
 	ExitTask                     // finish
